@@ -124,6 +124,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->tickets = 10;
+  p->rounds = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -223,6 +225,9 @@ userinit(void)
   p = allocproc();
   initproc = p;
 
+  p->tickets = 10;
+  p->rounds = 0;
+
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
@@ -275,8 +280,13 @@ kfork(void)
   }
   np->sz = p->sz;
 
+  np->tickets = p->tickets;
+  np->rounds = 0;
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+
+
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
@@ -418,6 +428,33 @@ kwait(uint64 addr)
   }
 }
 
+int
+do_rand(unsigned long *ctx)
+{
+  long hi, lo, x;
+
+  x = (*ctx % 0x7ffffffe) + 1;
+  hi = x / 127773;
+  lo = x % 127773;
+  x = 16807 * lo - 2836 * hi;
+
+  if(x < 0)
+    x += 0x7fffffff;
+
+  x--;
+
+  *ctx = x;
+
+  return x;
+}
+
+unsigned long rand_next = 1;
+
+int
+rand(void)
+{
+  return do_rand(&rand_next);
+}
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -432,43 +469,65 @@ scheduler(void)
   struct cpu *c = mycpu();
 
   c->proc = 0;
-  for (;;) {
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
+
+  for(;;){
     intr_on();
     intr_off();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
+    int total = 0;
+
+    for(p = proc; p < &proc[NPROC]; p++){
       acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
 
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+      if(p->state == RUNNABLE){
+        total = total + p->tickets;
       }
+
       release(&p->lock);
     }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+
+    if(total == 0){
+      asm volatile("wfi");
+      continue;
+    }
+
+    int winner = rand() % total;
+
+    int current = 0;
+    int selected = 0;
+
+    for(p = proc; p < &proc[NPROC]; p++){
+      acquire(&p->lock);
+
+      if(p->state == RUNNABLE){
+        current = current + p->tickets;
+
+        if(winner < current){
+          p->state = RUNNING;
+          c->proc = p;
+
+          p->rounds++;
+
+          swtch(&c->context, &p->context);
+
+          mycpu()->intena = 0;
+          c->proc = 0;
+
+          selected = 1;
+
+          release(&p->lock);
+          break;
+        }
+      }
+
+      release(&p->lock);
+    }
+
+    if(selected == 0){
       asm volatile("wfi");
     }
   }
 }
-
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
 // intena because intena is a property of this
@@ -695,7 +754,7 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printk("%d %s %s", p->pid, state, p->name);
+    printk("%d %s %s tickets=%d rounds=%d", p->pid, state, p->name, p->tickets, p->rounds);
     printk("\n");
   }
 }
